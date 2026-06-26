@@ -371,3 +371,61 @@ SharpHound.exe --CollectionMethod All
 ## Countermeasures Summary
 - **SNMP**: Disable if unused. Prefer SNMPv3 with auth + encryption. Rotate community strings off defaults. Restrict source IPs.
 - **LDAP**: Disable anonymous bind. Alert on bulk queries (SIEM). Enforce LDAP signing & channel binding. Trim "Authenticated Users" read permissions. Apply a strong password/lockout policy. Place admins in the Protected Users group.
+
+Here's the whole methodology explained in plain terms — what each step does, why it's there, and how each finding feeds the next. Two protocols, same underlying loop: *probe → read what came back → decide the next probe.*
+
+## The mental model first
+
+Enumeration is just structured asking. You're not breaking anything — you're querying services that are designed to answer questions, and seeing how much they'll tell you. SNMP and LDAP are both "ask a server, get structured data back" protocols, which is exactly why they leak so much when misconfigured.
+
+---
+
+## SNMP side
+
+**What SNMP is.** It's a protocol for monitoring/managing devices. A "manager" (you) asks an "agent" (the target) for values, over **UDP port 161**. Every piece of data lives at an address called an **OID** (object identifier), and the whole set of OIDs is the **MIB** (a big tree). Access is gated by a **community string**, which is basically a plaintext password. The classic default is `public` (read) and `private` (read-write).
+
+**Step 1 — Discover agents.** `nmap -sU -p 161` sweeps the subnet for anything listening on UDP 161. You're just finding which boxes even run SNMP. Result: a list of live agents.
+
+**Step 2 — Find a valid community string.** A listening agent is useless without the "password." `onesixtyone` tries a wordlist of common strings against the host. If `public` answers, you have read access — and the very first reply often leaks the OS version in the banner. *Finding chains forward:* no community = dead end; valid community = everything below opens up.
+
+**Step 3 — Dump system info.** With a working community, `snmpwalk` walks the entire MIB tree, dumping everything readable. `snmp-check` does the same but formats it into readable sections (hostname, network interfaces, open ports, processes, shares). You instantly learn the OS, hostname, uptime, and network layout — a full profile of the box without logging in.
+
+**Step 4 — Enumerate users.** Windows SNMP agents, when configured, expose local account names under a specific OID branch (the LAN Manager MIB). Walking it gives you real usernames like `Administrator`, `Guest`, `jdoe`. This matters because usernames are the raw material for any later credential work.
+
+**Step 5 — Enumerate processes & software.** Two more OID branches list running processes and installed software *with version numbers*. The point isn't the process list itself — it's spotting outdated software whose versions map to known CVEs. You're building a list of candidate weaknesses, not exploiting anything yet.
+
+**Step 6 — Spot write access.** If a *second* community (often `private`) also answers, that's a read-write community — a critical finding on its own, because RW means the device can be reconfigured, not just read. In the rewritten README this stays a *finding you report*; the actual disruptive writes (rebooting, changing routes) are deliberately out of scope.
+
+---
+
+## LDAP side
+
+**What LDAP is.** It's the query language/protocol for directory services — in practice, **Active Directory**. You talk to a **domain controller** over **TCP 389** (or 636 encrypted). You **bind** (authenticate, or try "anonymous"), then send a search: a **base DN** (where in the tree to look, e.g. `DC=corp,DC=local`) plus a **filter** (what to match, e.g. `(objectClass=user)`). The DC returns matching objects. AD is a goldmine because it holds every user, group, and policy in the org.
+
+**Step 1 — Find the DC and confirm LDAP is open.** `nmap -p 389,636,3268,3269` confirms the box is a domain controller (those four ports are the LDAP + global catalog set). The SRV DNS lookup is an alternate way to locate DCs by name.
+
+**Step 2 — Test anonymous bind.** Try querying with no credentials. If the DC hands back directory data anyway, anonymous bind is enabled — a critical misconfiguration. Most modern AD disables this, so the realistic path is: query with any valid low-priv user, who can still read most of the directory.
+
+**Step 3 — Enumerate usernames.** With a bind, `ldapsearch` (or `windapsearch` for clean output) filtered on `(objectClass=user)` returns every account name in the domain, including service accounts (`svc_*`). Now you have the full user list.
+
+**Step 4 — Read the password policy.** Before *any* credential testing, you query the domain's lockout threshold, lockout duration, and minimum length. This is pure recon with a purpose: it tells you the safe envelope (e.g. "locks after 5 tries / 30-min window") so later authorized testing doesn't lock everyone out. You record it; you don't act on it here.
+
+**Step 5 — Map groups and Domain Admins.** Query the `Domain Admins` group and read its `member` attribute — those are your high-value targets. Knowing `adunn` is a Domain Admin tells you who to prioritize and where compromise would be most damaging.
+
+**Step 6 — Identify Kerberoastable accounts.** Filter on `(servicePrincipalName=*)`. Any account with an SPN set is, by design, *requestable* via Kerberos — meaning it's a "Kerberoasting" candidate. This is the enumeration boundary: you record *which* accounts are exposed; the actual ticket-request-and-crack is a separate, in-scope exploitation phase that the README intentionally stops short of.
+
+**Step 7 — Collect for BloodHound.** SharpHound gathers all this directory + session data into a graph. Loaded into BloodHound, it visually shows the *shortest paths to Domain Admin*, delegation issues, and where admins are logged in. It's still enumeration — it tells you which attack paths *exist*; walking them is the next phase.
+
+---
+
+## When LDAP is blocked
+
+If port 389 is firewalled, the same directory facts leak through other doors: **RPC** (`rpcclient enumdomusers`), **SMB** (`crackmapexec --users`), **Kerberos** username validation (`kerbrute`), or a rare **DNS zone transfer**. Different protocol, same data — you rebuild the user/host picture and re-enter the LDAP flow once you have a foothold.
+
+---
+
+## The one idea tying it together
+
+Every step produces a **finding** that becomes the **input** to the next step: open port → valid community/bind → system profile → user list → privileged targets → attack-path map. The rewritten README keeps you on the *information-gathering* side of that chain and labels where the boundary is, so it's a recon reference rather than an attack walkthrough.
+
+Want me to turn this explanation into a single flow diagram (SVG, sharp text, repo-ready) showing the SNMP and LDAP chains side by side with the finding→next-step arrows?
