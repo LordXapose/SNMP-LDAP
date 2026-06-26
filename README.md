@@ -1,277 +1,407 @@
-
 ```markdown
-# SNMP & LDAP Enumeration – Reconnaissance Guide
+# SNMP & LDAP Enumeration – Complete Hands-On Guide
 
-This document outlines techniques, tools, and countermeasures for enumerating **SNMP** (Simple Network Management Protocol) and **LDAP** (Lightweight Directory Access Protocol) during internal penetration tests or red team engagements. Both protocols often expose critical information that can be leveraged for lateral movement, privilege escalation, and domain compromise.
+This is a **practical, example-driven** guide to enumerating **SNMP** and **LDAP** services during penetration tests. Every section includes the exact commands, expected outputs, and how to turn the gathered data into further attacks.
 
 ---
 
 ## Table of Contents
 
+- [Lab Environment (Optional)](#lab-environment-optional)
 - [SNMP Enumeration](#snmp-enumeration)
-  - [Overview](#overview)
-  - [Why Enumerate SNMP?](#why-enumerate-snmp)
-  - [SNMP Versions & Security](#snmp-versions--security)
-  - [Key OIDs & Data Locations](#key-oids--data-locations)
-  - [Enumeration Process & Tools](#enumeration-process--tools)
-    - [1. Discovery](#1-discovery)
-    - [2. Community String Brute-Force](#2-community-string-brute-force)
-    - [3. Data Extraction](#3-data-extraction)
-    - [4. Advanced & Write-Access](#4-advanced--write-access)
-  - [Countermeasures](#countermeasures)
+  - [How SNMP Works (In One Minute)](#how-snmp-works-in-one-minute)
+  - [Walkthrough: Full SNMP Enumeration from Scratch](#walkthrough-full-snmp-enumeration-from-scratch)
+    - [1. Discover SNMP Devices](#1-discover-snmp-devices)
+    - [2. Find Valid Community Strings](#2-find-valid-community-strings)
+    - [3. Dump System Information](#3-dump-system-information)
+    - [4. Extract User Accounts (Windows)](#4-extract-user-accounts-windows)
+    - [5. Extract Running Processes & Software](#5-extract-running-processes--software)
+    - [6. Exploiting Write Access (Dangerous!)](#6-exploiting-write-access-dangerous)
 - [LDAP Enumeration](#ldap-enumeration)
-  - [Overview](#overview-1)
-  - [Why Enumerate LDAP?](#why-enumerate-ldap)
-  - [Authentication & Access Levels](#authentication--access-levels)
-  - [LDAP Query Basics](#ldap-query-basics)
-  - [Enumeration Tools & Techniques](#enumeration-tools--techniques)
-    - [1. Discovery](#1-discovery-1)
-    - [2. Anonymous Enumeration](#2-anonymous-enumeration)
-    - [3. Authenticated Enumeration](#3-authenticated-enumeration)
-    - [4. High-Value Data Extraction](#4-high-value-data-extraction)
-    - [5. Indirect Enumeration (Without Direct LDAP)](#5-indirect-enumeration-without-direct-ldap)
-  - [Countermeasures](#countermeasures-1)
-- [Quick Reference Table](#quick-reference-table)
-- [Useful Command Cheat Sheet](#useful-command-cheat-sheet)
+  - [How LDAP Works (In One Minute)](#how-ldap-works-in-one-minute)
+  - [Walkthrough: Full LDAP Enumeration from Scratch](#walkthrough-full-ldap-enumeration-from-scratch)
+    - [1. Discover Domain Controllers & LDAP Ports](#1-discover-domain-controllers--ldap-ports)
+    - [2. Test for Anonymous Bind](#2-test-for-anonymous-bind)
+    - [3. Dump All Usernames](#3-dump-all-usernames)
+    - [4. Extract Password Policy](#4-extract-password-policy)
+    - [5. Map Groups and Domain Admins](#5-map-groups-and-domain-admins)
+    - [6. Find Kerberoastable Accounts (SPNs)](#6-find-kerberoastable-accounts-spns)
+    - [7. BloodHound Attack Path Analysis](#7-bloodhound-attack-path-analysis)
+- [Indirect Enumeration (When LDAP is Blocked)](#indirect-enumeration-when-ldap-is-blocked)
+- [Quick Command Cheat Sheet](#quick-command-cheat-sheet)
+- [Countermeasures Summary](#countermeasures-summary)
+
+---
+
+## Lab Environment (Optional)
+To follow along, you can set up:
+- **SNMP**: An Ubuntu VM with `snmpd` installed and configured with `public` community. Or a Windows box with SNMP service enabled.
+- **LDAP**: A Windows Server with Active Directory Domain Services, or a lightweight AD lab using [GOAD](https://github.com/Orange-Cyberdefense/GOAD), [BadBlood](https://github.com/davidprowe/BadBlood), or [DetectionLab](https://github.com/clong/DetectionLab).
+
+All examples assume you are on the same network as the targets.
 
 ---
 
 ## SNMP Enumeration
 
-### Overview
-**SNMP** is a UDP-based protocol (ports 161/162) used to manage network devices. A manager queries agents for data stored in the **Management Information Base (MIB)**. Misconfigured SNMP services can leak a wealth of information.
+### How SNMP Works (In One Minute)
+- Manager (you) sends a request to an agent (the target) over **UDP 161**.
+- The request includes a **community string** (like a password) and the **OID** you want.
+- The agent replies with the value of that OID.
+- `snmpwalk` sends a series of `GETNEXT` requests to walk the entire MIB tree.
 
-### Why Enumerate SNMP?
-- Discover device types, OS, and software versions
-- Extract network information (IPs, MAC addresses, routing tables)
-- List running processes and installed software
-- Enumerate user accounts (especially on Windows with SNMP enabled)
-- Identify shared resources and running services
+### Walkthrough: Full SNMP Enumeration from Scratch
 
-### SNMP Versions & Security
-| Version  | Authentication | Encryption       | Weaknesses                                  |
-|----------|----------------|------------------|---------------------------------------------|
-| SNMPv1   | Community string (plaintext) | None             | Default "public"/"private", no encryption   |
-| SNMPv2c  | Community string (plaintext) | None             | Same as v1, slightly better performance     |
-| SNMPv3   | User-based (MD5/SHA) | Optional (DES/AES) | Weak configs still possible but far stronger |
+**Target**: 192.168.1.50 (a Windows 10 box with SNMP enabled, community `public`)
 
-### Key OIDs & Data Locations
-| Information                | OID (numeric)                        |
-|----------------------------|--------------------------------------|
-| System description         | `1.3.6.1.2.1.1.1`                  |
-| Hostname                   | `1.3.6.1.2.1.1.5`                  |
-| Uptime                     | `1.3.6.1.2.1.1.3`                  |
-| Running processes          | `1.3.6.1.2.1.25.4.2.1.2`           |
-| Installed software         | `1.3.6.1.2.1.25.6.3.1.2`           |
-| TCP connections            | `1.3.6.1.2.1.6.13.1.3`             |
-| UDP listeners              | `1.3.6.1.2.1.7.5.1.1`              |
-| Windows user accounts      | `1.3.6.1.4.1.77.1.2.25` (Samba/LanManager) |
+---
 
-### Enumeration Process & Tools
-
-#### 1. Discovery
+#### 1. Discover SNMP Devices
+Scan the subnet for open UDP 161:
 ```bash
 nmap -sU -p 161 --open 192.168.1.0/24
 ```
+Output:
+```
+Nmap scan report for 192.168.1.50
+PORT    STATE SERVICE
+161/udp open  snmp
+```
+Now you know a live SNMP agent.
 
-#### 2. Community String Brute-Force
+---
+
+#### 2. Find Valid Community Strings
+Try common strings with **onesixtyone**:
 ```bash
-# onesixtyone – fast community string scan
-onesixtyone -c community.txt 192.168.1.0/24
+echo public > community.txt
+echo private >> community.txt
+echo manager >> community.txt
+onesixtyone -c community.txt 192.168.1.50
+```
+Output:
+```
+Scanning 1 hosts, 3 communities
+192.168.1.50 [public] Hardware: x86 Family 6 Model 158 Stepping 10 AT/AT COMPATIBLE - Software: Windows Version 6.3 (Build 19044)
+```
+✅ **`public` works!** The response also leaks the OS version.
 
-# Nmap script
-nmap -sU -p 161 --script snmp-brute <target>
+---
 
-# Hydra
-hydra -P community.txt <target> snmp
-
-# Metasploit
-use auxiliary/scanner/snmp/snmp_login
+#### 3. Dump System Information
+Run a full `snmpwalk` (this may take a while):
+```bash
+snmpwalk -v 2c -c public 192.168.1.50
+```
+First few lines:
+```
+SNMPv2-MIB::sysDescr.0 = STRING: Hardware: x86 Family 6 Model 158 Stepping 10 AT/AT COMPATIBLE - Software: Windows Version 6.3 (Build 19044)
+SNMPv2-MIB::sysObjectID.0 = OID: windowsSnmpAgent
+DISMAN-EXPRESSION-MIB::sysUpTimeInstance = Timeticks: (147259) 0:24:32.59
+SNMPv2-MIB::sysName.0 = STRING: WIN10-PC
 ```
 
-#### 3. Data Extraction
-Once a read community string (`public`, etc.) is known:
+You immediately have:
+- **OS**: Windows 10 (Build 19044)
+- **Hostname**: `WIN10-PC`
+- **Uptime**: 24 minutes → freshly booted.
 
+To get a cleaner, structured overview, use **snmp-check**:
 ```bash
-# Walk the entire MIB tree
-snmpwalk -v 2c -c public 192.168.1.10
+snmp-check 192.168.1.50 -c public
+```
+Sections include:
+- System information (hostname, domain, users)
+- Network interfaces (IP, MAC)
+- IP routes
+- TCP/UDP connections (open ports!)
+- Processes
+- Storage
+- Shares
 
-# Focus on a specific OID subtree
-snmpwalk -v 2c -c public 192.168.1.10 1.3.6.1.4.1.77.1.2.25
+---
 
-# snmp-check – structured output (users, network, processes)
-snmp-check 192.168.1.10 -c public
+#### 4. Extract User Accounts (Windows)
+Windows SNMP agents (when configured) expose local users via the LAN Manager MIB:
+```bash
+snmpwalk -v 2c -c public 192.168.1.50 1.3.6.1.4.1.77.1.2.25
+```
+Output:
+```
+iso.3.6.1.4.1.77.1.2.25.1.1.5.65.100.109.105.110 = STRING: "Administrator"
+iso.3.6.1.4.1.77.1.2.25.1.1.6.71.117.101.115.116 = STRING: "Guest"
+iso.3.6.1.4.1.77.1.2.25.1.1.7.106.100.111.101 = STRING: "jdoe"
+```
+We now have **valid local usernames**: `Administrator`, `Guest`, `jdoe`. These can be used for password attacks.
 
-# Metasploit modules
-use auxiliary/scanner/snmp/snmp_enum
-use auxiliary/scanner/snmp/snmp_enumusers
-use auxiliary/scanner/snmp/snmp_enumshares
+---
+
+#### 5. Extract Running Processes & Software
+Processes:
+```bash
+snmpwalk -v 2c -c public 192.168.1.50 1.3.6.1.2.1.25.4.2.1.2
+```
+Output snippet:
+```
+HOST-RESOURCES-MIB::hrSWRunName.1 = STRING: "System Idle Process"
+HOST-RESOURCES-MIB::hrSWRunName.4 = STRING: "smss.exe"
+...
+HOST-RESOURCES-MIB::hrSWRunName.652 = STRING: "firefox.exe"
+```
+You can see a user is running Firefox. If you find outdated software (e.g., Java 1.8.0_131), you can exploit known CVEs.
+
+Installed software:
+```bash
+snmpwalk -v 2c -c public 192.168.1.50 1.3.6.1.2.1.25.6.3.1.2
 ```
 
-#### 4. Advanced & Write-Access
-- **Write community** (`private`): use `snmpset` to modify configs, reboot devices, or change routes.
-- **Extended OID walking**: some devices expose custom MIBs (e.g., Cisco, HP). Check vendor documentation.
+---
 
-### Countermeasures
-- **Disable SNMP** if not required.
-- Enforce **SNMPv3** with authentication and encryption.
-- Change default community strings; use long, complex values.
-- Apply **access control lists (ACLs)** to limit which IPs can query SNMP.
-- Monitor for rapid SNMP walks (excessive `GETNEXT` requests) using SIEM/IDS.
-- Block SNMP at the network perimeter.
+#### 6. Exploiting Write Access (Dangerous!)
+If you discover the **read-write** community (often `private`), you can:
+- Reboot the device: `snmpset -v 2c -c private 192.168.1.50 1.3.6.1.4.1... i 1`
+- Change routing table entries.
+- Modify network interface state (disable/enable).
+
+Always **check with extreme caution**. In a pentest, confirm and stop—do not disrupt unless explicitly allowed.
 
 ---
 
 ## LDAP Enumeration
 
-### Overview
-**LDAP** (TCP/UDP 389, LDAPS 636, Global Catalog 3268/3269) provides access to directory services, most commonly Microsoft Active Directory. Even anonymous or low-privileged queries can expose massive amounts of AD data.
+### How LDAP Works (In One Minute)
+- LDAP queries are sent to a domain controller over **TCP 389 (or 636 for LDAPS)**.
+- You bind (authenticate) as a user, or try **anonymous bind**.
+- You send a search request with a **base DN** (e.g., `DC=domain,DC=com`) and an **LDAP filter** (e.g., `(objectClass=user)`).
+- The server returns matching objects with the attributes you requested.
 
-### Why Enumerate LDAP?
-- Compile valid usernames for password spraying
-- Map group memberships (domain admins, privileged groups)
-- Extract domain structure (OUs, domains, trusts)
-- Gather computer names and OS versions
-- Retrieve password policy (lockout, complexity)
-- Discover Service Principal Names (SPNs) for Kerberoasting
-- Read descriptive fields that sometimes contain passwords
+### Walkthrough: Full LDAP Enumeration from Scratch
 
-### Authentication & Access Levels
-- **Anonymous bind** – No credentials; often disabled by default but still found in legacy environments.
-- **Simple bind** – Uses a valid username/password; access is determined by the user’s group memberships.
-- **Authenticated users** – In Active Directory, any domain user can read most attributes unless explicitly restricted.
+**Target**: `dc.corp.local` (192.168.1.10), Windows Domain Controller.
 
-### LDAP Query Basics
-All queries use **LDAP search filters** (RFC 4515):
-- `(objectClass=user)` – All user objects
-- `(&(objectClass=user)(sAMAccountName=jdoe))` – Specific user
-- `(memberOf=CN=Domain Admins,CN=Users,DC=domain,DC=com)` – Members of a group
-- `(servicePrincipalName=*)` – All objects with an SPN (kerberoastable accounts)
+---
 
-### Enumeration Tools & Techniques
-
-#### 1. Discovery
+#### 1. Discover Domain Controllers & LDAP Ports
+Find DCs and confirm LDAP is open:
 ```bash
-nmap -p 389,636,3268,3269 192.168.1.0/24
-
-# Nmap LDAP scripts
-nmap -p 389 --script ldap-search <target>
+nmap -p 389,636,3268,3269 192.168.1.10
+```
+Output:
+```
+PORT     STATE SERVICE
+389/tcp  open  ldap
+636/tcp  open  ldapssl
+3268/tcp open  globalcatLDAP
+3269/tcp open  globalcatLDAPssl
 ```
 
-#### 2. Anonymous Enumeration
-If anonymous bind is allowed, the directory can be scraped completely.
-
+Often you'll find the DC by its DNS name; you can also run:
 ```bash
-# ldapsearch (Linux)
-ldapsearch -x -H ldap://dc.domain.com -b "DC=domain,DC=com"
-
-# Extract all usernames
-ldapsearch -x -H ldap://dc.domain.com -b "DC=domain,DC=com" "(objectClass=user)" sAMAccountName
-
-# windapsearch (Python) – great for AD enumeration, supports anonymous
-windapsearch --dc-ip 192.168.1.10 --module users
-
-# Nmap NSE with empty credentials
-nmap -p 389 --script ldap-search --script-args 'ldap.username="",ldap.password=""' <target>
+nslookup -type=SRV _ldap._tcp.corp.local
 ```
 
-#### 3. Authenticated Enumeration
-With valid domain credentials (even a low-privileged user):
+---
 
-- **BloodHound / SharpHound** – Collects all AD objects and relationships; essential for finding attack paths.
-- **ldapdomaindump** – Generates HTML/JSON/grepable reports of users, groups, computers, trusts.
+#### 2. Test for Anonymous Bind
+Try to connect without credentials:
+```bash
+ldapsearch -x -H ldap://192.168.1.10 -b "DC=corp,DC=local" 
+```
+- If it returns tons of data → **anonymous bind enabled** (critical finding).
+- If it returns `inappropriate authentication` or `unwilling to perform`, anonymous is disabled.
+
+Many modern ADs disable anonymous bind by default, but you can still query with a valid user account. For the rest of this walkthrough, we'll assume you have a low-privileged domain user: `corp\jdoe:Spring2024`.
+
+---
+
+#### 3. Dump All Usernames
+With credentials:
+```bash
+ldapsearch -x -H ldap://192.168.1.10 \
+  -D "cn=jdoe,cn=Users,dc=corp,dc=local" -w 'Spring2024' \
+  -b "DC=corp,DC=local" "(objectClass=user)" sAMAccountName
+```
+Output (truncated):
+```
+# jdoe, Users, corp.local
+dn: CN=John Doe,CN=Users,DC=corp,DC=local
+sAMAccountName: jdoe
+
+# adunn, Users, corp.local
+dn: CN=Alice Dunn,CN=Users,DC=corp,DC=local
+sAMAccountName: adunn
+
+# svc_backup, Users, corp.local
+dn: CN=Backup Service,CN=Users,DC=corp,DC=local
+sAMAccountName: svc_backup
+...
+```
+Now you have a **valid user list** ready for password spraying.
+
+A faster method is **windapsearch** (Python):
+```bash
+windapsearch --dc-ip 192.168.1.10 -d corp.local -u jdoe -p Spring2024 --module users
+```
+It prints a clean table of usernames and DN.
+
+---
+
+#### 4. Extract Password Policy
+Before spraying, check the lockout threshold and password complexity:
+```bash
+ldapsearch -x -H ldap://192.168.1.10 -D "cn=jdoe,cn=Users,dc=corp,dc=local" -w 'Spring2024' \
+  -b "DC=corp,DC=local" "(objectClass=domainDNS)" lockoutThreshold lockoutDuration minPwdLength pwdProperties
+```
+Output:
+```
+lockoutThreshold: 5
+lockoutDuration: -18000000000 (30 minutes)
+minPwdLength: 7
+pwdProperties: 1 (DOMAIN_PASSWORD_COMPLEX)
+```
+Interpretation:
+- Account locks after 5 bad attempts → spray carefully.
+- 30‑minute lockout → you can try 1 password every 31 minutes per user, or use a list of only 4-5 passwords.
+
+---
+
+#### 5. Map Groups and Domain Admins
+Find Domain Admins group:
+```bash
+ldapsearch -x -H ldap://192.168.1.10 -D "cn=jdoe,cn=Users,dc=corp,dc=local" -w 'Spring2024' \
+  -b "CN=Domain Admins,CN=Users,DC=corp,DC=local"
+```
+Output shows `member` attributes listing DNs of admin users. Translate them:
+```
+member: CN=Administrator,CN=Users,DC=corp,DC=local
+member: CN=Alice Dunn,CN=Users,DC=corp,DC=local
+```
+Now you know `adunn` is a domain admin—a prime target for keylogging or token theft.
+
+With **windapsearch**:
+```bash
+windapsearch --dc-ip 192.168.1.10 -d corp.local -u jdoe -p Spring2024 --module domain-admins
+```
+
+---
+
+#### 6. Find Kerberoastable Accounts (SPNs)
+Look for service accounts with SPNs:
+```bash
+ldapsearch -x -H ldap://192.168.1.10 -D "cn=jdoe,cn=Users,dc=corp,dc=local" -w 'Spring2024' \
+  -b "DC=corp,DC=local" "(servicePrincipalName=*)" sAMAccountName servicePrincipalName
+```
+Output:
+```
+# svc_sql, Users, corp.local
+sAMAccountName: svc_sql
+servicePrincipalName: MSSQLSvc/sql.corp.local:1433
+
+# svc_backup, Users, corp.local
+sAMAccountName: svc_backup
+servicePrincipalName: backup/backup.corp.local
+```
+These are perfect for **Kerberoasting**: request their TGS tickets and crack offline.
+
+Use **Impacket's GetUserSPNs**:
+```bash
+impacket-GetUserSPNs corp.local/jdoe:Spring2024 -dc-ip 192.168.1.10 -request
+```
+This outputs encrypted TGS hashes; crack them with hashcat mode 13100.
+
+---
+
+#### 7. BloodHound Attack Path Analysis
+The ultimate LDAP data collection. Run SharpHound on a domain-joined machine (or via runas):
+```powershell
+SharpHound.exe --CollectionMethod All --Domain corp.local
+```
+This produces a zip file. Load it into BloodHound, then:
+- Search for "Shortest Paths to Domain Admins"
+- Look for **Kerberoastable** users, **unconstrained delegation** machines, or **AS-REP roastable** accounts.
+- Find sessions of admins on workstations.
+
+The visual graph instantly shows you next steps.
+
+---
+
+## Indirect Enumeration (When LDAP is Blocked)
+If port 389 is firewalled, you can still enumerate AD via:
+
+- **RPC (135/445)**:  
   ```bash
-  ldapdomaindump -u 'DOMAIN\user' -p 'password' dc.domain.com
+  rpcclient -U "" -N 192.168.1.10
+  > enumdomusers
   ```
-- **PowerView (PowerShell)** – In-memory AD enumeration:
-  ```powershell
-  Get-NetUser | select samaccountname
-  Get-NetGroup "Domain Admins" | select member
-  Get-NetComputer | select name, operatingsystem
+- **SMB**:  
+  ```bash
+  crackmapexec smb 192.168.1.10 --users
   ```
-- **ADExplorer (Sysinternals)** – GUI snapshot of the entire domain.
-- **Apache Directory Studio** – Cross-platform LDAP browser with GUI.
+- **Kerberos username brute-force**:  
+  ```bash
+  kerbrute userenum -d corp.local --dc 192.168.1.10 users.txt
+  ```
+- **DNS zone transfer** (rare):  
+  ```bash
+  dig axfr @192.168.1.10 corp.local
+  ```
 
-#### 4. High-Value Data Extraction
-- **User descriptions** (`description` attribute) – often contain sensitive information.
-- **Password policy** – `ldapsearch` on the `defaultNamingContext`; also `Get-ADDefaultDomainPasswordPolicy`.
-- **SPN enumeration** – `(servicePrincipalName=*)` returns service accounts ripe for Kerberoasting.
-- **AS-REP roastable users** – Users with `DONT_REQ_PREAUTH` (look for `userAccountControl: 1.2.840.113556.1.4.803:=4194304`).
-- **Trust relationships** – Look for `trustedDomain` objects to map forest trusts.
-- **Machine accounts with unconstrained delegation** – Often targeted for escalation.
-
-#### 5. Indirect Enumeration (Without Direct LDAP)
-If LDAP ports are filtered, you can still enumerate Active Directory via:
-- **RPC** (135/445) – `rpcclient -U "" -N <DC>`, then `enumdomusers`
-- **SMB** – `crackmapexec smb <target> --users` or `enum4linux`
-- **Kerberos** – `kerbrute userenum` for username brute-forcing
-- **DNS** – Zone transfer (rare) or brute-force hostnames
-
-### Countermeasures
-- **Disable anonymous binds** (default in modern AD, but verify).
-- Restrict “Authenticated Users” from reading all attributes if possible (carefully test).
-- Enable **LDAP signing** and **channel binding** to prevent NTLM relay.
-- Monitor for bulk LDAP queries (e.g., a single IP requesting all user objects in a short time).
-- Implement a strong password policy; the main risk from LDAP enumeration is username discovery for password attacks.
-- Use **Protected Users** group for privileged accounts to prevent credential caching.
+All these can give you similar data without touching LDAP.
 
 ---
 
-## Quick Reference Table
-
-| Aspect               | SNMP                                          | LDAP                                           |
-|----------------------|-----------------------------------------------|------------------------------------------------|
-| **Default port(s)**  | 161/UDP (162 for traps)                       | 389/TCP, 636 (LDAPS), 3268/3269 (GC)          |
-| **Primary use**      | Network device monitoring & management        | Directory services (authentication, authorisation) |
-| **Common misconfig** | Default community strings, SNMPv1/v2c         | Anonymous bind, excessive default permissions  |
-| **Key info leaked**  | Users, processes, network configs, routes     | Users, groups, SPNs, password policies, trusts |
-| **Top tools**        | `snmpwalk`, `snmp-check`, `onesixtyone`       | `ldapsearch`, `windapsearch`, `BloodHound`     |
-
----
-
-## Useful Command Cheat Sheet
+## Quick Command Cheat Sheet
 
 ### SNMP
 ```bash
-# Scan for SNMP
+# Scan
 nmap -sU -p 161 --open 192.168.1.0/24
 
-# Brute-force community strings
-onesixtyone -c community.txt 192.168.1.10
+# Community brute
+onesixtyone -c community.txt 192.168.1.50
 
-# Walk entire tree
-snmpwalk -v 2c -c public 192.168.1.10
+# Full walk
+snmpwalk -v 2c -c public 192.168.1.50
 
-# Get structured info
-snmp-check 192.168.1.10 -c public
+# Nice report
+snmp-check 192.168.1.50 -c public
 
-# Windows users (if enabled)
-snmpwalk -v 1 -c public 192.168.1.10 1.3.6.1.4.1.77.1.2.25
+# Windows users
+snmpwalk -v 1 -c public 192.168.1.50 1.3.6.1.4.1.77.1.2.25
 
-# Set value (write community required)
-snmpset -v 2c -c private 192.168.1.10 1.3.6.1.something i 1
+# Write a value (careful)
+snmpset -v 2c -c private 192.168.1.50 <OID> i 1
 ```
 
 ### LDAP
 ```bash
-# Anonymous search
-ldapsearch -x -H ldap://dc.domain.com -b "DC=domain,DC=com"
+# Anonymous bind test
+ldapsearch -x -H ldap://dc.corp.local -b "DC=corp,DC=local"
 
-# Get all users
-ldapsearch -x -H ldap://dc.domain.com -b "DC=domain,DC=com" "(objectClass=user)" sAMAccountName
+# Authenticated user dump
+ldapsearch -x -H ldap://dc.corp.local -D "cn=jdoe,cn=Users,dc=corp,dc=local" -w 'pass' -b "DC=corp,DC=local" "(objectClass=user)" sAMAccountName
 
-# windapsearch (no creds)
-windapsearch --dc-ip 10.10.10.10 --module users
+# Domain admins
+ldapsearch ... -b "CN=Domain Admins,CN=Users,DC=corp,DC=local"
 
-# Authenticated dump
-ldapdomaindump -u 'DOMAIN\user' -p 'pass' dc.domain.com
+# SPNs for kerberoasting
+ldapsearch ... "(servicePrincipalName=*)" sAMAccountName servicePrincipalName
 
-# BloodHound collector (SharpHound.exe on target)
-SharpHound.exe --CollectionMethod All --Domain domain.com
+# Quick windapsearch
+windapsearch --dc-ip 192.168.1.10 -d corp.local -u jdoe -p pass --module users
+windapsearch --dc-ip 192.168.1.10 -d corp.local -u jdoe -p pass --module domain-admins
 
-# Kerberoasting candidates
-ldapsearch -x -H ldap://dc.domain.com -D "user@domain.com" -w password -b "DC=domain,DC=com" "(servicePrincipalName=*)" sAMAccountName servicePrincipalName
+# Kerberoasting
+impacket-GetUserSPNs corp.local/jdoe:pass -dc-ip 192.168.1.10 -request
+
+# BloodHound collection
+SharpHound.exe --CollectionMethod All
 ```
 
+---
 
-This README covers everything from your detailed explanation in a clean, ready-to-use format. If you'd like to add a specific lab scenario, remove the disclaimer, or adjust formatting, let me know.
+## Countermeasures Summary
+- **SNMP**: Disable if not needed. Use SNMPv3 with strong auth+encryption. Change community strings. Restrict source IPs.
+- **LDAP**: Disable anonymous bind. Monitor for bulk queries (SIEM alerts). Enforce LDAP signing & channel binding. Limit “Authenticated Users” permissions. Apply strong password policies. Put admins in Protected Users group.
+
+This version gives you **a complete, reproducible walkthrough** of both protocols with realistic outputs and actions. You can copy-paste it directly into your repository or notes. If you want me to add even more detail (e.g., interpreting NTLM hashes, or using Metasploit modules), just say the word.
