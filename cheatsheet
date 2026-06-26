@@ -1,0 +1,118 @@
+# SNMP & LDAP Enumeration — Cheat Sheet
+
+Quick reference. Authorized targets only. Each line is `command` → what it does.
+Example IPs: SNMP host `192.168.1.50`, DC `192.168.1.10`, domain `corp.local`, user `jdoe:Spring2024`.
+
+---
+
+## SNMP (UDP 161)
+
+### Discover
+```bash
+nmap -sU -p 161 --open 192.168.1.0/24      # UDP scan: find hosts with port 161 open
+onesixtyone 192.168.1.0/24 public          # fast sweep: find agents answering to "public"
+```
+
+### Find community string
+```bash
+printf 'public\nprivate\nmanager\n' > community.txt   # build a wordlist
+onesixtyone -c community.txt 192.168.1.50             # try each string against the host
+```
+
+### Read data (needs a valid community)
+```bash
+snmpwalk -v 2c -c public 192.168.1.50                 # walk the whole MIB tree (everything readable)
+snmp-check 192.168.1.50 -c public                     # same data, formatted into clean sections
+```
+
+### Targeted OID walks
+```bash
+snmpwalk -v 2c -c public 192.168.1.50 1.3.6.1.4.1.77.1.2.25   # local Windows usernames
+snmpwalk -v 2c -c public 192.168.1.50 1.3.6.1.2.1.25.4.2.1.2  # running processes
+snmpwalk -v 2c -c public 192.168.1.50 1.3.6.1.2.1.25.6.3.1.2  # installed software (+ versions)
+```
+
+### Flags
+```
+-sU        UDP scan (SNMP is UDP)        -v 2c   SNMP version 2c
+-p 161     port 161 only                 -c      community string
+--open     show only open ports          -c file (onesixtyone) wordlist of strings
+```
+
+**Findings → next:** open 161 → valid community → host profile → user list → version-based weaknesses.
+**RW community (e.g. `private`) = critical finding.** Report it; don't issue writes without explicit scope.
+
+---
+
+## LDAP (TCP 389 / 636)
+
+### Discover the DC
+```bash
+nmap -p 389,636,3268,3269 192.168.1.10        # confirm DC: LDAP, LDAPS, Global Catalog ports
+nslookup -type=SRV _ldap._tcp.corp.local      # locate DCs by name via DNS SRV record
+```
+
+### Test anonymous bind
+```bash
+ldapsearch -x -H ldap://192.168.1.10 -b "DC=corp,DC=local"   # query with no creds
+# returns data = anonymous bind ENABLED (critical); error = disabled
+```
+
+### Authenticated reads (low-priv user is enough)
+```bash
+# All usernames
+ldapsearch -x -H ldap://192.168.1.10 -D "cn=jdoe,cn=Users,dc=corp,dc=local" -w 'Spring2024' \
+  -b "DC=corp,DC=local" "(objectClass=user)" sAMAccountName
+
+# Password / lockout policy (know your safe limits before any cred testing)
+ldapsearch -x -H ldap://192.168.1.10 -D "cn=jdoe,cn=Users,dc=corp,dc=local" -w 'Spring2024' \
+  -b "DC=corp,DC=local" "(objectClass=domainDNS)" \
+  lockoutThreshold lockoutDuration minPwdLength pwdProperties
+
+# Domain Admins group members (high-value targets)
+ldapsearch -x -H ldap://192.168.1.10 -D "cn=jdoe,cn=Users,dc=corp,dc=local" -w 'Spring2024' \
+  -b "CN=Domain Admins,CN=Users,DC=corp,DC=local"
+
+# Kerberoastable accounts (service accounts with an SPN)
+ldapsearch -x -H ldap://192.168.1.10 -D "cn=jdoe,cn=Users,dc=corp,dc=local" -w 'Spring2024' \
+  -b "DC=corp,DC=local" "(servicePrincipalName=*)" sAMAccountName servicePrincipalName
+```
+
+### Faster wrappers
+```bash
+windapsearch --dc-ip 192.168.1.10 -d corp.local -u jdoe -p Spring2024 --module users          # clean user table
+windapsearch --dc-ip 192.168.1.10 -d corp.local -u jdoe -p Spring2024 --module domain-admins   # admins
+SharpHound.exe --CollectionMethod All --Domain corp.local                                       # collect graph for BloodHound
+```
+
+### Flags
+```
+-x        simple auth          -b   base DN (where to search)
+-H        LDAP URL/host        -D   bind DN (who you log in as)
+-w        bind password        "(...)"   LDAP filter (what to match)
+```
+
+**Findings → next:** open 389 → bind → user list → policy → privileged accounts → SPNs / attack-path map.
+**Enumeration stops at SPN discovery and BloodHound collection.** Cracking and path-walking are separate, in-scope phases.
+
+---
+
+## When LDAP is blocked (port 389 firewalled)
+```bash
+rpcclient -U "" -N 192.168.1.10            # then: enumdomusers  (pull users over RPC 135/445)
+crackmapexec smb 192.168.1.10 --users      # list users over SMB
+kerbrute userenum -d corp.local --dc 192.168.1.10 users.txt   # validate usernames via Kerberos
+dig axfr @192.168.1.10 corp.local          # DNS zone transfer (rare, but dumps records if allowed)
+```
+
+---
+
+## Common ports
+```
+SNMP    161/udp                 LDAP   389/tcp        LDAPS  636/tcp
+RPC     135/tcp                 SMB    445/tcp        GC     3268/3269/tcp
+```
+
+## Hardening (one-liners)
+- **SNMP:** disable if unused · SNMPv3 (auth+encryption) · rotate community strings · restrict source IPs.
+- **LDAP:** disable anonymous bind · enforce signing + channel binding · trim "Authenticated Users" reads · strong lockout policy · admins in Protected Users.
